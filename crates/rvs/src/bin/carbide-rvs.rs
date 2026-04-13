@@ -20,12 +20,19 @@
 //! External validation orchestrator for NICC. Bridges NICC with test
 //! frameworks (Benchpress, MPI-based, SLURM-based, etc.) to perform
 //! partition-aware rack validation.
-//!
-//! NOTE: This is still a tracer / playground. The abstractions are
-//! crystallizing but main.rs is not yet the final shape.
 
 use std::path::PathBuf;
 
+use carbide_rvs::artifact;
+use carbide_rvs::client;
+use carbide_rvs::config::Config;
+use carbide_rvs::ctx::RvsCtx;
+use carbide_rvs::error::RvsError;
+use carbide_rvs::partitions::Partitions;
+use carbide_rvs::rack;
+use carbide_rvs::scenario;
+use carbide_rvs::validation;
+use clap::Parser;
 use forge_tls::client_config::ClientCert;
 use rpc::forge_tls_client::{ApiConfig, ForgeClientConfig};
 use tokio::io::AsyncWriteExt;
@@ -34,20 +41,16 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-mod client;
-mod config;
-mod error;
-mod partitions;
-mod rack;
-mod scenario;
-mod validation;
-
-use client::NiccClient;
-use config::Config;
-use partitions::Partitions;
+#[derive(Parser)]
+#[command(about = "Rack Validation Service")]
+struct Cli {
+    /// Path to TOML config file. Defaults and CARBIDE_RVS__* env vars apply if omitted.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
 
 #[tokio::main]
-async fn main() -> Result<(), error::RvsError> {
+async fn main() -> Result<(), RvsError> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
@@ -59,23 +62,29 @@ async fn main() -> Result<(), error::RvsError> {
 
     tracing::info!("carbide-rvs: Rack Validation Service starting");
 
+    let cli = Cli::parse();
+
     // Load config: defaults -> optional TOML -> CARBIDE_RVS__* env vars
-    let config_path = parse_config_path()?;
-    let cfg = Config::load(config_path.as_deref())?;
+    let cfg = Config::load(cli.config.as_deref())?;
     tracing::info!(config = ?cfg, "config loaded");
 
-    // Try loading scenario -- soft fail, this is tracer code
-    let scenario = match scenario::Scenario::load(std::path::Path::new(&cfg.scenario_config_path)) {
-        Ok(s) => {
-            tracing::info!(scenario = ?s, "scenario loaded");
-            Some(s)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "scenario not loaded, continuing without it");
-            None
-        }
-    };
-    let os_uri = scenario.as_ref().map(|s| s.os.uri.as_str()).unwrap_or("");
+    // Load all scenarios -- soft fail per file so a single bad config doesn't block others.
+    let scenarios: Vec<scenario::Scenario> = cfg
+        .scenario_config_paths
+        .iter()
+        .filter_map(|path| {
+            match scenario::Scenario::load(std::path::Path::new(path)) {
+                Ok(s) => {
+                    tracing::info!(path, model = %s.rack.model, sot_release = %s.rack.sot_release, "scenario loaded");
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "scenario not loaded, skipping");
+                    None
+                }
+            }
+        })
+        .collect();
 
     // Build NICC client from config
     let client_cert = ClientCert {
@@ -84,19 +93,20 @@ async fn main() -> Result<(), error::RvsError> {
     };
     let client_config = ForgeClientConfig::new(cfg.tls.root_cafile_path.clone(), Some(client_cert));
     let api_config = ApiConfig::new(&cfg.nicc.url, &client_config);
-    let nicc = NiccClient::new(&api_config);
+    let nicc = client::NiccClient::new(&api_config);
+
+    let ctx = RvsCtx { nicc, scenarios, cfg, sot_override_path: None };
 
     // Liveness probe server
-
-    let listen_addr = cfg.metrics_endpoint.to_string();
+    let listen_addr = ctx.cfg.metrics_endpoint.to_string();
     tracing::info!(addr = %listen_addr, "starting liveness HTTP server");
 
-    let listener = tokio::net::TcpListener::bind(cfg.metrics_endpoint).await?;
+    let listener = tokio::net::TcpListener::bind(ctx.cfg.metrics_endpoint).await?;
 
     // Run validation and liveness concurrently; a hard error from validation
     // exits the process.
     tokio::select! {
-        result = run_validation(&nicc, os_uri, cfg.poll_interval_secs) => result?,
+        result = run_validation(&ctx) => result?,
         () = serve_liveness(listener) => {},
     }
 
@@ -128,34 +138,19 @@ async fn serve_liveness(listener: tokio::net::TcpListener) {
     }
 }
 
-/// Parse `--config <path>` from argv. Returns `None` if the flag is absent.
-fn parse_config_path() -> Result<Option<PathBuf>, error::RvsError> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--config" {
-            let path = args.next().ok_or_else(|| {
-                error::RvsError::InvalidArg("--config requires a path argument".to_string())
-            })?;
-            return Ok(Some(PathBuf::from(path)));
-        }
-    }
-    Ok(None)
-}
-
 // Rack validation high-level flow
-async fn run_validation(
-    nicc: &NiccClient,
-    os_uri: &str,
-    poll_interval_secs: u64,
-) -> Result<(), error::RvsError> {
-    let interval = std::time::Duration::from_secs(poll_interval_secs);
+async fn run_validation(ctx: &RvsCtx) -> Result<(), RvsError> {
+    artifact::start_cache_server(ctx).await?;
+    let interval = std::time::Duration::from_secs(ctx.cfg.poll_interval_secs);
     loop {
-        let racks = rack::fetch_racks(nicc).await?;
-        for job in validation::plan(Partitions::try_from(racks)?, nicc, os_uri).await? {
+        let racks = rack::fetch_racks(&ctx.nicc).await?;
+        artifact::process_artifacts(&racks, ctx).await?;
+        let os_uri = ctx.scenarios.first().map(|s| s.os.uri.as_str()).unwrap_or("");
+        for job in validation::plan(Partitions::try_from(racks)?, &ctx.nicc, os_uri).await? {
             let report = validation::validate_partition(job).await?;
             validation::submit_report(report).await?;
         }
-        tracing::info!(poll_interval_secs, "validation: cycle complete, sleeping");
+        tracing::info!(ctx.cfg.poll_interval_secs, "validation: cycle complete, sleeping");
         tokio::time::sleep(interval).await;
     }
 }

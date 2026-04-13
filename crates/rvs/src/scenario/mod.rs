@@ -1,8 +1,12 @@
 #![allow(dead_code)]
 
+mod resolver;
+
 use std::path::Path;
 
 use serde::Deserialize;
+
+pub use resolver::resolve_artifact_urls;
 
 /// Rack model + SOT release this scenario targets.
 #[derive(Debug, Deserialize)]

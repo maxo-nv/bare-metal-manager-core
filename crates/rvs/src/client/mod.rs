@@ -2,7 +2,9 @@ mod io;
 use std::collections::HashMap;
 
 pub use io::NiccClient;
-use rpc::forge::{Machine, Rack};
+use rpc::forge::{Machine, Rack, RackFirmware};
+
+use crate::error::RvsError;
 
 /// NVLink fields extracted from gRPC Machine.
 #[derive(Debug)]
@@ -117,5 +119,25 @@ impl From<Rack> for RackData {
                 .map(|id| id.to_string())
                 .collect(),
         }
+    }
+}
+
+/// SOT JSON blob returned from NICC for a rack firmware/release record.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct RackFirmwareData {
+    /// Firmware record ID.
+    pub id: String,
+    /// Parsed SOT JSON -- used for JSONPath artifact resolution.
+    pub config: serde_json::Value,
+}
+
+impl TryFrom<RackFirmware> for RackFirmwareData {
+    type Error = RvsError;
+
+    fn try_from(value: RackFirmware) -> Result<Self, Self::Error> {
+        let config = serde_json::from_str(&value.config_json)
+            .map_err(|e| RvsError::InvalidArg(format!("invalid SOT JSON: {e}")))?;
+        Ok(Self { id: value.id, config })
     }
 }
